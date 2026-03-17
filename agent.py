@@ -7,23 +7,30 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-ENV_FILE = ROOT_DIR / ".env.agent.secret"
+ENV_FILES = [ROOT_DIR / ".env.agent.secret", ROOT_DIR / ".env.docker.secret"]
 DEFAULT_TIMEOUT_SECONDS = 45
 MAX_TOOL_CALLS = 10
+DEFAULT_AGENT_API_BASE_URL = "http://localhost:42002"
 SYSTEM_PROMPT = (
-    "You are a documentation agent for this repository. "
-    "Answer questions using the project wiki and repository files. "
-    "Start by using list_files to discover relevant files, especially under wiki/. "
-    "Then use read_file to inspect the most relevant file. "
-    "When you know the answer, respond with a JSON object containing exactly two string fields: "
-    '"answer" and "source". '
-    "The source must be the best supporting reference, preferably a wiki path with a section anchor such as "
-    'wiki/git.md#merge-conflict. '
-    "Do not invent files or anchors. "
-    "Use tools for repository facts instead of guessing."
+    "You are a repository and system agent for this project. "
+    "The wiki can be outdated, so use the real system or source code when the question is about current backend behavior. "
+    "Choose tools carefully: "
+    "use list_files to discover directories or router modules, "
+    "use read_file for wiki pages, source code, Docker files, and configuration, "
+    "and use query_api for live API behavior, data counts, status codes, and endpoint errors. "
+    "For bug-diagnosis questions, query the API first to observe the real error, then read the relevant source file and explain the cause. "
+    "For framework questions, read the source code instead of guessing. "
+    "For router-module questions, list backend/app/routers. "
+    "When query_api returns both an authenticated result and an unauthenticated_request field, "
+    "use the unauthenticated_request field only for questions that explicitly ask about missing authentication; otherwise use the top-level status_code and body. "
+    "When you know the answer, respond with a JSON object containing an 'answer' string and, when helpful, a 'source' string. "
+    "The source should be the best supporting file path or endpoint path, and it may be omitted for pure API answers. "
+    "Do not invent files, anchors, endpoints, or values. "
+    "Use tools instead of guessing."
 )
 
 
@@ -34,14 +41,14 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_files",
             "description": (
                 "List files and directories for a relative path in the repository. "
-                "Use this first to discover wiki files before reading them."
+                "Use this to discover wiki pages, backend modules, and router files before reading them."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from the repository root, for example 'wiki'.",
+                        "description": "Relative directory path from the repository root, for example 'wiki' or 'backend/app/routers'.",
                     }
                 },
                 "required": ["path"],
@@ -53,16 +60,52 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file from the repository using a relative path.",
+            "description": (
+                "Read a UTF-8 text file from the repository using a relative path. "
+                "Use this for wiki pages, Python source code, docker-compose.yml, Dockerfile, and other config files."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative file path from the repository root, for example 'wiki/git.md'.",
+                        "description": "Relative file path from the repository root, for example 'wiki/git.md' or 'backend/app/main.py'.",
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": (
+                "Call the deployed backend API. "
+                "Use this for live endpoint behavior, authentication status codes, current database counts, and data-dependent analytics questions. "
+                "The tool authenticates the main request with LMS_API_KEY from the environment. "
+                "For safe GET or HEAD requests, it may also include an unauthenticated_request field that shows what happens without the Authorization header. "
+                "For normal data questions, use the top-level status_code and body. "
+                "For questions that explicitly ask about missing authentication, use unauthenticated_request.status_code and unauthenticated_request.body."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method such as GET, POST, PUT, PATCH, or DELETE.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path beginning with '/', for example '/items/' or '/analytics/completion-rate?lab=lab-99'.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body encoded as a string. Omit it for GET requests.",
+                    },
+                },
+                "required": ["method", "path"],
                 "additionalProperties": False,
             },
         },
@@ -92,6 +135,11 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def load_local_env_files() -> None:
+    for env_file in ENV_FILES:
+        load_env_file(env_file)
+
+
 def require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if value:
@@ -101,6 +149,19 @@ def require_env(name: str) -> str:
 
 def normalize_api_base(api_base: str) -> str:
     return api_base.rstrip("/")
+
+
+def normalize_api_path(path: str) -> str:
+    raw = (path or "").strip()
+    if not raw:
+        raise ValueError("API path must not be empty")
+
+    parts = urlsplit(raw)
+    path_part = parts.path or "/"
+    if not path_part.startswith("/"):
+        path_part = f"/{path_part}"
+
+    return urlunsplit(("", "", path_part, parts.query, parts.fragment))
 
 
 def extract_text_content(message_content: Any) -> str:
@@ -195,9 +256,122 @@ def list_files(path: str) -> str:
     return "\n".join(lines)
 
 
+def parse_http_body(raw_body: bytes) -> Any:
+    text = raw_body.decode("utf-8", errors="replace")
+    stripped = text.strip()
+    if not stripped:
+        return ""
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped
+
+
+def http_request(
+    *,
+    url: str,
+    method: str,
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+) -> dict[str, Any]:
+    request_headers = {"Accept": "application/json"}
+    if headers:
+        request_headers.update(headers)
+
+    data: bytes | None = None
+    if body is not None:
+        data = body.encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+
+    request = urllib.request.Request(
+        url=url,
+        data=data,
+        headers=request_headers,
+        method=method,
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+            return {
+                "status_code": response.getcode(),
+                "body": parse_http_body(response.read()),
+            }
+    except urllib.error.HTTPError as exc:
+        return {
+            "status_code": exc.code,
+            "body": parse_http_body(exc.read()),
+        }
+    except urllib.error.URLError as exc:
+        return {
+            "status_code": 0,
+            "body": {"error": f"Request failed: {exc.reason}"},
+        }
+
+
+def query_api(method: str, path: str, body: str | None = None) -> str:
+    load_local_env_files()
+
+    method_normalized = (method or "").strip().upper()
+    if not method_normalized:
+        return json.dumps({"error": "Tool argument 'method' must be a non-empty string"}, ensure_ascii=False)
+
+    try:
+        path_normalized = normalize_api_path(path)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    api_base = normalize_api_base(os.environ.get("AGENT_API_BASE_URL", DEFAULT_AGENT_API_BASE_URL))
+    url = f"{api_base}{path_normalized}"
+
+    body_text: str | None
+    if body is None:
+        body_text = None
+    else:
+        body_text = body if isinstance(body, str) else json.dumps(body)
+
+    result: dict[str, Any] = {
+        "method": method_normalized,
+        "path": path_normalized,
+    }
+
+    api_key = os.environ.get("LMS_API_KEY", "").strip()
+    if api_key:
+        authenticated = http_request(
+            url=url,
+            method=method_normalized,
+            headers={"Authorization": f"Bearer {api_key}"},
+            body=body_text,
+        )
+        result.update(authenticated)
+        result["auth_used"] = True
+    else:
+        unauthenticated_only = http_request(
+            url=url,
+            method=method_normalized,
+            headers={},
+            body=body_text,
+        )
+        result.update(unauthenticated_only)
+        result["auth_used"] = False
+        result["auth_error"] = "Missing required environment variable: LMS_API_KEY"
+
+    if method_normalized in {"GET", "HEAD"} and body_text is None:
+        unauthenticated = http_request(
+            url=url,
+            method=method_normalized,
+            headers={},
+            body=None,
+        )
+        result["unauthenticated_request"] = unauthenticated
+
+    return json.dumps(result, ensure_ascii=False)
+
+
 TOOL_IMPLEMENTATIONS: dict[str, Any] = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -206,15 +380,31 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
     if tool is None:
         return f"ERROR: Unknown tool: {name}"
 
-    path = arguments.get("path")
-    if not isinstance(path, str):
-        return "ERROR: Tool argument 'path' must be a string"
+    if name in {"read_file", "list_files"}:
+        path = arguments.get("path")
+        if not isinstance(path, str):
+            return "ERROR: Tool argument 'path' must be a string"
+        return tool(path)
 
-    return tool(path)
+    if name == "query_api":
+        method = arguments.get("method")
+        path = arguments.get("path")
+        body = arguments.get("body")
+
+        if not isinstance(method, str):
+            return "ERROR: Tool argument 'method' must be a string"
+        if not isinstance(path, str):
+            return "ERROR: Tool argument 'path' must be a string"
+        if body is not None and not isinstance(body, str):
+            return "ERROR: Tool argument 'body' must be a string when provided"
+
+        return tool(method, path, body)
+
+    return f"ERROR: Unknown tool: {name}"
 
 
 def call_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    load_env_file(ENV_FILE)
+    load_local_env_files()
 
     api_key = require_env("LLM_API_KEY")
     api_base = normalize_api_base(require_env("LLM_API_BASE"))
@@ -292,6 +482,10 @@ def parse_final_answer(content: str, fallback_source: str) -> tuple[str, str]:
 def infer_fallback_source(tool_calls: list[dict[str, Any]]) -> str:
     for tool_call in reversed(tool_calls):
         if tool_call["tool"] == "read_file":
+            path = tool_call["args"].get("path")
+            if isinstance(path, str) and path.strip():
+                return path.strip()
+        if tool_call["tool"] == "query_api":
             path = tool_call["args"].get("path")
             if isinstance(path, str) and path.strip():
                 return path.strip()
@@ -420,3 +614,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv))
+
