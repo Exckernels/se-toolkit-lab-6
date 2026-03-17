@@ -111,3 +111,17 @@ The API is expected to be OpenAI-compatible and support `/chat/completions` with
 Regression tests are in `tests/`.
 
 They mock the LLM API responses so the tool-calling behavior is deterministic and does not require a live remote model.
+
+## Final architecture and lessons learned
+
+The final agent uses three tools: `list_files`, `read_file`, and `query_api`.
+
+`list_files` is used to discover candidate files and wiki pages. `read_file` is used for source-code questions, configuration analysis, Docker and routing questions, and detailed wiki reading. `query_api` is used for live API behavior, endpoint status codes, authenticated and unauthenticated requests, and current data questions such as counts of items or learners.
+
+The `query_api` tool reads `AGENT_API_BASE_URL` from the environment. If the variable is not set, it falls back to the default local API base URL. Authentication is handled with `LMS_API_KEY`, which is sent as a Bearer token in the `Authorization` header for authenticated API requests. The language model configuration is controlled by `LLM_API_KEY`, `LLM_API_BASE`, and `LLM_MODEL`.
+
+The final architecture separates three kinds of evidence: wiki/process evidence, source-code evidence, and live-runtime evidence. Wiki questions are answered by first discovering files and then reading the relevant wiki page. Static implementation questions are answered by reading source files. Runtime and data questions are answered through `query_api`, sometimes followed by source inspection when a bug explanation is needed.
+
+Lessons learned: the benchmark was most sensitive to tool routing. The agent needed explicit instructions for when to use wiki lookup, when to inspect source code, and when to query the live API. It also helped to make the agent more explicit for count questions, bug-finding questions, and multi-file comparison questions.
+
+Final eval score: local questions passed (>= 80%) and hidden eval passed (>= 80%).

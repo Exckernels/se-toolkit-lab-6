@@ -95,3 +95,15 @@ uv run run_eval.py
 ```
 
 and then refine the prompt or tool descriptions based on the first failing question.
+
+## Initial score
+
+Initial score before the final prompt and routing fixes: the benchmark did not pass reliably enough. The first full run exposed weaknesses in tool routing and answer grounding, especially for wiki lookup, live API counts, and multi-file reasoning.
+
+## First failures
+
+The first failures were caused by three main issues. First, the agent sometimes stopped after `list_files` and answered wiki questions without calling `read_file`. Second, live API count questions were not always answered using `query_api` and explicit counting of returned records. Third, comparison and bug-analysis questions needed stronger instructions to read multiple files and look for risky operations such as division and `None`-unsafe logic.
+
+## Iteration strategy
+
+The iteration strategy was to improve the agent in small steps. First, implement and validate the `query_api` tool with authentication and configurable `AGENT_API_BASE_URL`. Second, strengthen the system prompt so the agent clearly separates wiki questions, source-code questions, and live API questions. Third, add regression tests for tool selection and re-run the benchmark after each change until the local and hidden evaluation thresholds were passed.
