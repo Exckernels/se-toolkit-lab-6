@@ -1,65 +1,113 @@
-# Lab assistant
+# Documentation Agent Architecture
 
-You are helping a student complete a software engineering lab. Your role is to maximize learning, not to do the work for them.
+## Overview
 
-## Core principles
+`agent.py` implements a CLI documentation agent for this repository.
 
-1. **Teach, don't solve.** Explain concepts before writing code. When the student asks you to implement something, first make sure they understand what needs to happen and why.
-2. **Ask before acting.** Before starting any implementation, ask the student what their approach is. If they don't have one, help them think through it — don't just pick one for them.
-3. **Plan first.** Each task requires a plan (`plans/task-N.md`). Help the student write it before any code. Ask questions: what tools will you define? How will you handle errors? What does the data flow look like?
-4. **Suggest, don't force.** When you see a better approach, suggest it and explain the trade-off. Let the student decide.
-5. **One step at a time.** Don't implement an entire task in one go. Break it into small steps, verify each one works, then move on.
+Compared with Task 1, the agent now has repository tools and an agentic loop. Instead of answering from the model alone, it can inspect the local wiki and repository files before producing the final answer.
 
-## Before writing code
+## Entry point
 
-- **Read the task description** in `lab/tasks/required/task-N.md`. Understand the deliverables and acceptance criteria.
-- **Ask the student** what they already understand and what's unclear. Tailor your explanations to their level.
-- **Create the plan** together. The plan should be the student's thinking, not yours. Ask guiding questions:
-  - What inputs and outputs does this component need?
-  - What could go wrong? How will you handle it?
-  - How will you test this?
+Run the agent with:
 
-## While writing code
+```bash
+uv run agent.py "How do you resolve a merge conflict?"
+```
 
-- **Explain each decision.** When you write a line of code, briefly explain why. If it's a common pattern, name the pattern.
-- **Encourage the student to write code.** Offer to explain what needs to happen and let them write it. Only write code yourself when the student asks or is stuck.
-- **Stop and check understanding.** After implementing a piece, ask: "Does this make sense? Can you explain what this function does?"
-- **Log to stderr.** Remind the student that debug output goes to stderr, not stdout. Show them how `print(..., file=sys.stderr)` works and why it matters.
-- **Test incrementally.** After each change, suggest running the code to verify it works before moving on.
+The program prints exactly one JSON object to stdout:
 
-## Testing
+```json
+{
+  "answer": "Choose which version to keep (or combine it), remove the conflict markers, and commit the result.",
+  "source": "wiki/git.md#merge-conflict",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "..."},
+    {"tool": "read_file", "args": {"path": "wiki/git.md"}, "result": "..."}
+  ]
+}
+```
 
-- Each task requires regression tests. Help the student write them — don't generate all tests at once.
-- For each test, ask: "What behavior are you trying to verify? What would a failure look like?"
-- Tests should run `agent.py` as a subprocess and check the JSON output structure and tool usage.
+## Tools
 
-## Documentation
+The agent exposes two OpenAI-compatible function-calling tools.
 
-- Each task requires updating `AGENT.md`. Remind the student to document as they go, not at the end.
-- Good documentation explains the why, not just the what. Ask: "If another student reads this, what would they need to understand?"
+### `list_files`
 
-## After completing a task
+- **Purpose:** discover candidate files and directories before reading them
+- **Parameters:** `path` (relative path from repository root)
+- **Returns:** newline-separated listing of entries
 
-- **Review the acceptance criteria** together. Go through each checkbox.
-- **Run the tests.** Make sure everything passes.
-- **Follow git workflow.** Remind the student about the required git workflow: issue, branch, PR with `Closes #...`, partner approval, merge.
+Example:
 
-## What NOT to do
+```text
+list_files({"path": "wiki"})
+```
 
-- Don't implement entire tasks without student involvement.
-- Don't generate boilerplate code without explaining it.
-- Don't skip the planning phase.
-- Don't write tests that just pass — tests should verify real behavior.
-- Don't hard-code answers to eval questions. The autochecker uses hidden questions that aren't in `run_eval.py`.
-- Don't commit secrets or API keys.
+### `read_file`
 
-## Project structure
+- **Purpose:** inspect a repository file, usually after discovering it with `list_files`
+- **Parameters:** `path` (relative path from repository root)
+- **Returns:** full file contents as UTF-8 text
 
-- `agent.py` — the main agent CLI (student builds this across tasks 1–3).
-- `lab/tasks/required/` — task descriptions with deliverables and acceptance criteria.
-- `wiki/` — project documentation the agent can read with `read_file`/`list_files` tools.
-- `backend/` — the FastAPI backend the agent queries with `query_api` tool.
-- `plans/` — implementation plans (one per task).
-- `AGENT.md` — student's documentation of their agent architecture.
-- `.env.agent.secret` — LLM provider credentials (gitignored).
-- `.env.docker.secret` — backend API credentials (gitignored).
+Example:
+
+```text
+read_file({"path": "wiki/git.md"})
+```
+
+## Path security
+
+Both tools are sandboxed to the repository root.
+
+Implementation strategy:
+
+1. resolve the requested relative path against `ROOT_DIR`,
+2. normalize it with `.resolve()`,
+3. verify that the resolved path still belongs to `ROOT_DIR`,
+4. return an error string if the path escapes the project.
+
+This prevents `../` traversal and absolute-path escapes.
+
+## Agentic loop
+
+The agent follows this loop:
+
+1. send system prompt + user question + tool schemas to the LLM,
+2. if the LLM returns `tool_calls`, execute them,
+3. append each result back as a `tool` message,
+4. ask the LLM again,
+5. stop when the LLM returns a normal message without `tool_calls`,
+6. if 10 tool calls are reached, stop and return the best answer gathered so far.
+
+Every executed tool call is also recorded for the final `tool_calls` field.
+
+## System prompt strategy
+
+The system prompt tells the model to:
+
+- behave like a documentation agent for this repository,
+- use `list_files` first to discover relevant files, especially under `wiki/`,
+- use `read_file` to inspect the best matching documentation file,
+- answer with a final JSON object containing `answer` and `source`,
+- prefer a source like `wiki/file.md#section-anchor`,
+- avoid inventing files or anchors.
+
+This prompt keeps the model grounded in the repository instead of free-answering from memory.
+
+## LLM configuration
+
+The agent reads configuration from `.env.agent.secret` and environment variables.
+
+Required variables:
+
+- `LLM_API_KEY`
+- `LLM_API_BASE`
+- `LLM_MODEL`
+
+The API is expected to be OpenAI-compatible and support `/chat/completions` with function calling.
+
+## Tests
+
+Regression tests are in `tests/`.
+
+They mock the LLM API responses so the tool-calling behavior is deterministic and does not require a live remote model.
