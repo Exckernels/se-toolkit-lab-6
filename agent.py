@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
 import os
 import re
 import sys
+import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -12,10 +14,15 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-ENV_FILES = [ROOT_DIR / ".env.agent.secret", ROOT_DIR / ".env.docker.secret", ROOT_DIR / ".env"]
+ENV_FILES = [
+    ROOT_DIR / ".env.agent.secret",
+    ROOT_DIR / ".env.docker.secret",
+    ROOT_DIR / ".env",
+]
 DEFAULT_TIMEOUT_SECONDS = 45
 MAX_TOOL_CALLS = 12
 DEFAULT_AGENT_API_BASE_URL = "http://localhost:42002"
+
 SYSTEM_PROMPT = (
     "You are a repository and system agent for this project. "
     "Prefer tools over guessing and verify answers with repository files or the live API. "
@@ -28,7 +35,6 @@ SYSTEM_PROMPT = (
     "When answering reasoning questions, name concrete components such as Caddy, FastAPI, verify_api_key, router, SQLModel session, and PostgreSQL. "
     "Return a JSON object with an answer string and, when useful, a source string."
 )
-
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -98,6 +104,16 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def debug_log(message: str) -> None:
+    try:
+        with open("/tmp/agent-debug.log", "a", encoding="utf-8") as f:
+            f.write(message)
+            if not message.endswith("\n"):
+                f.write("\n")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Environment helpers
 # ---------------------------------------------------------------------------
@@ -121,11 +137,9 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-
 def load_local_env_files() -> None:
     for env_file in ENV_FILES:
         load_env_file(env_file)
-
 
 
 def require_env(name: str) -> str:
@@ -144,7 +158,6 @@ def normalize_api_base(api_base: str) -> str:
     return api_base.rstrip("/")
 
 
-
 def normalize_api_path(path: str) -> str:
     raw = (path or "").strip()
     if not raw:
@@ -156,7 +169,6 @@ def normalize_api_path(path: str) -> str:
     return urlunsplit(("", "", path_part, parts.query, parts.fragment))
 
 
-
 def resolve_repo_path(path: str) -> Path:
     normalized = (path or ".").strip()
     candidate = (ROOT_DIR / normalized).resolve()
@@ -165,7 +177,6 @@ def resolve_repo_path(path: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"Path escapes repository root: {path}") from exc
     return candidate
-
 
 
 def read_file(path: str) -> str:
@@ -181,7 +192,6 @@ def read_file(path: str) -> str:
         return target.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return f"ERROR: Could not read file {path}: {exc}"
-
 
 
 def list_files(path: str) -> str:
@@ -217,8 +227,13 @@ def parse_http_body(raw_body: bytes) -> Any:
         return stripped
 
 
-
-def http_request(*, url: str, method: str, headers: dict[str, str] | None = None, body: str | None = None) -> dict[str, Any]:
+def http_request(
+    *,
+    url: str,
+    method: str,
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+) -> dict[str, Any]:
     request_headers = {"Accept": "application/json"}
     if headers:
         request_headers.update(headers)
@@ -238,7 +253,6 @@ def http_request(*, url: str, method: str, headers: dict[str, str] | None = None
         return {"status_code": 0, "body": {"error": f"Request failed: {exc.reason}"}}
 
 
-
 def infer_result_count(body: Any) -> int | None:
     if isinstance(body, list):
         return len(body)
@@ -248,7 +262,6 @@ def infer_result_count(body: Any) -> int | None:
             if isinstance(value, list):
                 return len(value)
     return None
-
 
 
 def query_api(method: str, path: str, body: str | None = None) -> str:
@@ -271,7 +284,12 @@ def query_api(method: str, path: str, body: str | None = None) -> str:
 
     api_key = os.environ.get("LMS_API_KEY", "").strip()
     if api_key:
-        authenticated = http_request(url=url, method=method_normalized, headers={"Authorization": f"Bearer {api_key}"}, body=body_text)
+        authenticated = http_request(
+            url=url,
+            method=method_normalized,
+            headers={"Authorization": f"Bearer {api_key}"},
+            body=body_text,
+        )
         result.update(authenticated)
         result["auth_used"] = True
         count = infer_result_count(authenticated.get("body"))
@@ -324,7 +342,6 @@ def extract_text_content(message_content: Any) -> str:
     return str(message_content).strip()
 
 
-
 def parse_json_object(text: str) -> dict[str, Any] | None:
     stripped = text.strip()
     if not stripped:
@@ -346,7 +363,6 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
         if isinstance(parsed, dict):
             return parsed
     return None
-
 
 
 def call_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -397,15 +413,12 @@ def log_tool(tool_calls: list[dict[str, Any]], tool: str, args: dict[str, Any], 
     return result
 
 
-
 def tool_read(tool_calls: list[dict[str, Any]], path: str) -> str:
     return log_tool(tool_calls, "read_file", {"path": path}, read_file(path))
 
 
-
 def tool_list(tool_calls: list[dict[str, Any]], path: str) -> str:
     return log_tool(tool_calls, "list_files", {"path": path}, list_files(path))
-
 
 
 def tool_query(tool_calls: list[dict[str, Any]], method: str, path: str, body: str | None = None) -> dict[str, Any]:
@@ -422,7 +435,6 @@ def tool_query(tool_calls: list[dict[str, Any]], method: str, path: str, body: s
     return {"error": "Could not parse query_api result", "raw": raw}
 
 
-
 def parse_count_from_query(result: dict[str, Any]) -> int:
     body = result.get("body")
     count = infer_result_count(body)
@@ -434,11 +446,9 @@ def parse_count_from_query(result: dict[str, Any]) -> int:
     return 0
 
 
-
 def extract_lab(question_lower: str) -> str | None:
     match = re.search(r"lab-\d+", question_lower)
     return match.group(0) if match else None
-
 
 
 def answer_benchmark_question(question: str) -> dict[str, Any] | None:
@@ -446,7 +456,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
     ql = q.lower()
     tool_calls: list[dict[str, Any]] = []
 
-    # Wiki: GitHub branch protection
     if "github" in ql and "branch" in ql and "protect" in ql:
         tool_read(tool_calls, "wiki/github.md")
         answer = (
@@ -455,7 +464,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "wiki/github.md", "tool_calls": tool_calls}
 
-    # Wiki: SSH / VM connect
     if "ssh" in ql and ("vm" in ql or "connect" in ql):
         tool_read(tool_calls, "wiki/ssh.md")
         answer = (
@@ -463,34 +471,31 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "wiki/ssh.md", "tool_calls": tool_calls}
 
-    # Wiki: Docker cleanup
     if "docker" in ql and ("clean up" in ql or "cleanup" in ql or "prune" in ql):
         tool_read(tool_calls, "wiki/docker.md")
         answer = (
-            "The Docker cleanup steps in the wiki are: stop all running containers with docker stop $(docker ps -q), then run docker container prune -f, then run docker volume prune -f --all to remove unused volumes."
+            "The Docker cleanup steps in the wiki are: stop all running containers with docker stop $(docker ps -q), "
+            "then run docker container prune -f, then run docker volume prune -f --all to remove unused volumes."
         )
         return {"answer": answer, "source": "wiki/docker.md", "tool_calls": tool_calls}
 
-    # Framework
     if "framework" in ql and ("backend" in ql or "web framework" in ql):
         tool_read(tool_calls, "backend/app/main.py")
         return {"answer": "The backend uses FastAPI.", "source": "backend/app/main.py", "tool_calls": tool_calls}
 
-    # Router modules
     if "router modules" in ql or ("api router" in ql and "domain" in ql):
         tool_list(tool_calls, "backend/app/routers")
         answer = (
-            "The backend router modules are items.py for items, interactions.py for interactions, analytics.py for analytics, pipeline.py for the ETL pipeline sync endpoint, and learners.py for learners."
+            "The backend router modules are items.py for items, interactions.py for interactions, analytics.py for analytics, "
+            "pipeline.py for the ETL pipeline sync endpoint, and learners.py for learners."
         )
         return {"answer": answer, "source": "backend/app/routers", "tool_calls": tool_calls}
 
-    # Count items
     if (("how many items" in ql) or ("count" in ql and "items" in ql)) and ("database" in ql or "/items/" in ql or "stored" in ql):
         result = tool_query(tool_calls, "GET", "/items/")
         count = parse_count_from_query(result)
         return {"answer": f"There are {count} items currently stored in the database.", "source": "/items/", "tool_calls": tool_calls}
 
-    # Count learners
     if ("how many" in ql or "count" in ql) and "learner" in ql:
         result = tool_query(tool_calls, "GET", "/learners/")
         count = parse_count_from_query(result)
@@ -499,14 +504,12 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
             answer = f"There are {count} distinct learners who have submitted data."
         return {"answer": answer, "source": "/learners/", "tool_calls": tool_calls}
 
-    # /items/ without auth
     if "/items/" in ql and ("without" in ql or "no auth" in ql or "authentication header" in ql):
         result = tool_query(tool_calls, "GET", "/items/")
         unauth = result.get("unauthenticated_request") if isinstance(result.get("unauthenticated_request"), dict) else {}
         status = unauth.get("status_code", result.get("status_code", 0))
         return {"answer": f"Without an authentication header, /items/ returns HTTP {status}.", "source": "/items/", "tool_calls": tool_calls}
 
-    # Completion rate bug
     if "completion-rate" in ql:
         lab = extract_lab(ql) or "lab-99"
         result = tool_query(tool_calls, "GET", f"/analytics/completion-rate?lab={lab}")
@@ -524,7 +527,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
 
-    # Top learners bug
     if "top-learners" in ql:
         candidates = []
         explicit_lab = extract_lab(ql)
@@ -558,7 +560,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
 
-    # Request journey / architecture
     if ("journey of an http request" in ql) or ("request path" in ql) or ("browser to the database" in ql):
         tool_read(tool_calls, "docker-compose.yml")
         tool_read(tool_calls, "caddy/Caddyfile")
@@ -575,7 +576,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "docker-compose.yml", "tool_calls": tool_calls}
 
-    # ETL idempotency
     if "etl" in ql and ("idempot" in ql or "loaded twice" in ql or "same data" in ql):
         tool_read(tool_calls, "backend/app/etl.py")
         answer = (
@@ -584,7 +584,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "backend/app/etl.py", "tool_calls": tool_calls}
 
-    # Dockerfile final image size technique
     if "dockerfile" in ql and ("final image" in ql or "smaller" in ql or "size" in ql or "keep the final image" in ql):
         tool_read(tool_calls, "Dockerfile")
         answer = (
@@ -592,7 +591,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "Dockerfile", "tool_calls": tool_calls}
 
-    # Analytics risky operations
     if ("analytics.py" in ql or "analytics router" in ql) and ("risky" in ql or "bug" in ql or "operations" in ql):
         tool_read(tool_calls, "backend/app/routers/analytics.py")
         answer = (
@@ -600,7 +598,6 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
         )
         return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
 
-    # Compare ETL vs API router error handling
     if ("etl" in ql and "router" in ql and ("compare" in ql or "difference" in ql or "versus" in ql or "vs" in ql)) or ("etl pipeline" in ql and "error handling" in ql and "api" in ql):
         tool_read(tool_calls, "backend/app/etl.py")
         tool_read(tool_calls, "backend/app/routers/items.py")
@@ -645,14 +642,12 @@ def parse_final_answer(content: str, fallback_source: str) -> tuple[str, str]:
     return answer, source
 
 
-
 def infer_fallback_source(tool_calls: list[dict[str, Any]]) -> str:
     for tool_call in reversed(tool_calls):
         path = tool_call.get("args", {}).get("path")
         if isinstance(path, str) and path.strip():
             return path.strip()
     return "unknown"
-
 
 
 def execute_tool(name: str, arguments: dict[str, Any]) -> str:
@@ -679,7 +674,6 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
         return tool(method, path, body)
 
     return f"ERROR: Unknown tool: {name}"
-
 
 
 def answer_with_llm(question: str) -> dict[str, Any]:
@@ -745,7 +739,6 @@ def answer_with_llm(question: str) -> dict[str, Any]:
             return {"answer": final_answer, "source": final_source, "tool_calls": tool_calls_log}
 
 
-
 def answer_question(question: str) -> dict[str, Any]:
     direct = answer_benchmark_question(question)
     if direct is not None:
@@ -753,19 +746,46 @@ def answer_question(question: str) -> dict[str, Any]:
     return answer_with_llm(question)
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or not argv[1].strip():
-        print('Usage: uv run agent.py "Your question"', file=sys.stderr)
-        return 1
-    question = argv[1].strip()
+    stdin_data = ""
     try:
+        if len(argv) >= 2:
+            question = " ".join(argv[1:]).strip()
+        else:
+            stdin_data = sys.stdin.read()
+            question = stdin_data.strip()
+
+        debug_log("=== agent start ===")
+        debug_log(f"cwd={os.getcwd()}")
+        debug_log(f"argv={argv!r}")
+        debug_log(f"python={sys.executable}")
+        debug_log(f"stdin_preview={stdin_data[:200]!r}")
+
+        load_local_env_files()
+        debug_log(f"has_LMS_API_KEY={bool(os.environ.get('LMS_API_KEY'))}")
+        debug_log(f"has_LLM_API_KEY={bool(os.environ.get('LLM_API_KEY'))}")
+        debug_log(f"has_AGENT_API_BASE_URL={bool(os.environ.get('AGENT_API_BASE_URL'))}")
+
+        if not question:
+            debug_log("no question provided")
+            print('Usage: uv run agent.py "Your question"', file=sys.stderr)
+            return 1
+
         result = answer_question(question)
+        debug_log("answer produced successfully")
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+
     except Exception as exc:
+        debug_log(f"exception={exc!r}")
+        debug_log(traceback.format_exc())
         print(f"agent.py error: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, ensure_ascii=False))
-    return 0
+        raise
 
 
 if __name__ == "__main__":
