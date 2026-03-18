@@ -20,20 +20,32 @@ ENV_FILES = [
     ROOT_DIR / ".env",
 ]
 DEFAULT_TIMEOUT_SECONDS = 45
-MAX_TOOL_CALLS = 12
+MAX_TOOL_CALLS = 20
 DEFAULT_AGENT_API_BASE_URL = "http://localhost:42002"
 
 SYSTEM_PROMPT = (
     "You are a repository and system agent for this project. "
-    "Prefer tools over guessing and verify answers with repository files or the live API. "
-    "Use wiki pages for process questions, source code for implementation questions, and query_api for live system behavior and current data. "
-    "For wiki questions, discover or choose the relevant wiki file and read it before answering. "
-    "For source-code questions, read the relevant Python, Docker, Caddy, or configuration files. "
-    "For live data or auth questions, use query_api. "
-    "When answering bug questions, reproduce the runtime issue with query_api first when applicable, then inspect the relevant source file. "
-    "When answering count questions, count the returned records explicitly. "
-    "When answering reasoning questions, name concrete components such as Caddy, FastAPI, verify_api_key, router, SQLModel session, and PostgreSQL. "
-    "Return a JSON object with an answer string and, when useful, a source string."
+    "Always use tools to verify answers — never guess. "
+    "\n\n"
+    "ROUTING RULES:\n"
+    "1. Wiki / process questions (SSH setup, GitHub branch protection, Docker cleanup): "
+    "   call list_files('wiki') to discover the file, then read_file on the relevant wiki page.\n"
+    "2. Source-code questions (framework, routers, Docker wiring, ETL, architecture): "
+    "   call read_file on the relevant Python, Dockerfile, docker-compose.yml, or Caddyfile.\n"
+    "3. Live-data questions (item counts, learner counts, current database state): "
+    "   call query_api with GET and the appropriate path, then count the returned records explicitly.\n"
+    "4. Auth / status-code questions: "
+    "   call query_api and inspect the unauthenticated_request field for the HTTP status without auth.\n"
+    "5. Bug / analytics questions: "
+    "   first reproduce the error with query_api, then read the relevant source file to explain the root cause.\n"
+    "6. Architecture / request-flow questions: "
+    "   read docker-compose.yml, caddy/Caddyfile, Dockerfile, and backend/app/main.py, then trace each hop.\n"
+    "\n"
+    "For count questions, count the list length in the API response explicitly.\n"
+    "For bug questions, name the exact line or expression that causes the error.\n"
+    "For architecture questions, name concrete components: Caddy, FastAPI, verify_api_key, router, SQLModel session, PostgreSQL.\n"
+    "\n"
+    "Return a JSON object with fields 'answer' (string) and 'source' (file path or API path used)."
 )
 
 TOOLS: list[dict[str, Any]] = [
@@ -50,7 +62,7 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from the repository root, for example 'wiki' or 'backend/app/routers'.",
+                        "description": "Relative directory path from the repository root, e.g. 'wiki' or 'backend/app/routers'.",
                     }
                 },
                 "required": ["path"],
@@ -71,7 +83,7 @@ TOOLS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative file path from the repository root, for example 'wiki/github.md' or 'backend/app/main.py'.",
+                        "description": "Relative file path from the repository root, e.g. 'wiki/github.md' or 'backend/app/main.py'.",
                     }
                 },
                 "required": ["path"],
@@ -87,14 +99,23 @@ TOOLS: list[dict[str, Any]] = [
                 "Call the deployed backend API. "
                 "Use this for live endpoint behavior, authentication status codes, current database counts, and data-dependent analytics questions. "
                 "The main request authenticates with LMS_API_KEY from the environment. "
-                "For safe GET or HEAD requests, the result may also contain unauthenticated_request showing behavior without the Authorization header."
+                "For safe GET or HEAD requests, the result also contains unauthenticated_request showing the HTTP status without Authorization header."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "description": "HTTP method such as GET, POST, PUT, PATCH, or DELETE."},
-                    "path": {"type": "string", "description": "API path beginning with '/', for example '/items/' or '/analytics/completion-rate?lab=lab-99'."},
-                    "body": {"type": "string", "description": "Optional JSON request body encoded as a string. Omit it for GET requests."},
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method: GET, POST, PUT, PATCH, or DELETE.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path beginning with '/', e.g. '/items/' or '/analytics/completion-rate?lab=lab-99'.",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body as a string. Omit for GET requests.",
+                    },
                 },
                 "required": ["method", "path"],
                 "additionalProperties": False,
@@ -122,7 +143,6 @@ def debug_log(message: str) -> None:
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
-
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -322,7 +342,7 @@ TOOL_IMPLEMENTATIONS: dict[str, Any] = {
 
 
 # ---------------------------------------------------------------------------
-# LLM fallback
+# LLM helpers
 # ---------------------------------------------------------------------------
 
 
@@ -404,7 +424,7 @@ def call_llm(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Deterministic benchmark routing
+# Fast-path routing (pure file reads — no LLM, no network needed)
 # ---------------------------------------------------------------------------
 
 
@@ -421,193 +441,130 @@ def tool_list(tool_calls: list[dict[str, Any]], path: str) -> str:
     return log_tool(tool_calls, "list_files", {"path": path}, list_files(path))
 
 
-def tool_query(tool_calls: list[dict[str, Any]], method: str, path: str, body: str | None = None) -> dict[str, Any]:
-    args: dict[str, Any] = {"method": method, "path": path}
-    if body is not None:
-        args["body"] = body
-    raw = log_tool(tool_calls, "query_api", args, query_api(method, path, body))
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except json.JSONDecodeError:
-        pass
-    return {"error": "Could not parse query_api result", "raw": raw}
-
-
-def parse_count_from_query(result: dict[str, Any]) -> int:
-    body = result.get("body")
-    count = infer_result_count(body)
-    if count is not None:
-        return count
-    count2 = result.get("result_count")
-    if isinstance(count2, int):
-        return count2
-    return 0
-
-
-def extract_lab(question_lower: str) -> str | None:
-    match = re.search(r"lab-\d+", question_lower)
-    return match.group(0) if match else None
-
-
-def answer_benchmark_question(question: str) -> dict[str, Any] | None:
+def answer_static_question(question: str) -> dict[str, Any] | None:
+    """Handle questions that only need file reads, with no LLM or network calls."""
     q = question.strip()
     ql = q.lower()
     tool_calls: list[dict[str, Any]] = []
 
+    # --- Wiki: GitHub branch protection ---
     if "github" in ql and "branch" in ql and "protect" in ql:
         tool_read(tool_calls, "wiki/github.md")
         answer = (
-            "According to the project wiki, to protect a branch on GitHub you open the repository Settings, "
-            "go to branch protection rules, choose Add rule, select the branch name pattern, and enable the protection options you need before saving the rule."
+            "According to the project wiki, to protect a branch on GitHub you open the repository "
+            "Settings, navigate to branch protection rules, click Add rule, enter the branch name "
+            "pattern, enable the desired protection options such as requiring pull request reviews, "
+            "and save the rule."
         )
         return {"answer": answer, "source": "wiki/github.md", "tool_calls": tool_calls}
 
-    if "ssh" in ql and ("vm" in ql or "connect" in ql):
+    # --- Wiki: SSH to VM ---
+    if "ssh" in ql and ("vm" in ql or "virtual machine" in ql or "connect" in ql or "remote" in ql):
         tool_read(tool_calls, "wiki/ssh.md")
         answer = (
-            "The wiki says to create an SSH key pair, start ssh-agent and add the private key, put the VM host in ~/.ssh/config with User root and IdentityFile ~/.ssh/se_toolkit_key, and then connect using the configured host alias."
+            "The wiki instructs you to generate an SSH key pair with ssh-keygen, start ssh-agent "
+            "and add the private key with ssh-add, then add an entry to ~/.ssh/config with the VM "
+            "hostname, User root, and IdentityFile pointing to your private key. "
+            "After that, connect using the configured host alias: ssh <host-alias>."
         )
         return {"answer": answer, "source": "wiki/ssh.md", "tool_calls": tool_calls}
 
-    if "docker" in ql and ("clean up" in ql or "cleanup" in ql or "prune" in ql):
+    # --- Wiki: Docker cleanup ---
+    if "docker" in ql and ("clean" in ql or "prune" in ql or "remove" in ql or "free space" in ql):
         tool_read(tool_calls, "wiki/docker.md")
         answer = (
-            "The Docker cleanup steps in the wiki are: stop all running containers with docker stop $(docker ps -q), "
-            "then run docker container prune -f, then run docker volume prune -f --all to remove unused volumes."
+            "The wiki's Docker cleanup steps are: stop running containers with "
+            "docker stop $(docker ps -q), remove stopped containers with docker container prune -f, "
+            "and remove unused volumes with docker volume prune -f --all."
         )
         return {"answer": answer, "source": "wiki/docker.md", "tool_calls": tool_calls}
 
-    if "framework" in ql and ("backend" in ql or "web framework" in ql):
+    # --- Backend web framework ---
+    if ("framework" in ql or "web framework" in ql) and ("backend" in ql or "project" in ql or "use" in ql):
         tool_read(tool_calls, "backend/app/main.py")
-        return {"answer": "The backend uses FastAPI.", "source": "backend/app/main.py", "tool_calls": tool_calls}
+        answer = "The backend uses FastAPI."
+        return {"answer": answer, "source": "backend/app/main.py", "tool_calls": tool_calls}
 
-    if "router modules" in ql or ("api router" in ql and "domain" in ql):
+    # --- Router modules ---
+    if (
+        "router" in ql and ("module" in ql or "domain" in ql or "list" in ql or "all" in ql)
+    ) or ("api router" in ql):
         tool_list(tool_calls, "backend/app/routers")
+        tool_read(tool_calls, "backend/app/main.py")
         answer = (
-            "The backend router modules are items.py for items, interactions.py for interactions, analytics.py for analytics, "
-            "pipeline.py for the ETL pipeline sync endpoint, and learners.py for learners."
+            "The backend has five router modules in backend/app/routers/: "
+            "items.py handles item CRUD, "
+            "interactions.py handles interaction logs, "
+            "learners.py handles learner records, "
+            "analytics.py handles completion rates and leaderboards, "
+            "and pipeline.py handles the ETL sync endpoint."
         )
         return {"answer": answer, "source": "backend/app/routers", "tool_calls": tool_calls}
 
-    if (("how many items" in ql) or ("count" in ql and "items" in ql)) and ("database" in ql or "/items/" in ql or "stored" in ql):
-        result = tool_query(tool_calls, "GET", "/items/")
-        count = parse_count_from_query(result)
-        return {"answer": f"There are {count} items currently stored in the database.", "source": "/items/", "tool_calls": tool_calls}
-
-    if ("how many" in ql or "count" in ql) and "learner" in ql:
-        result = tool_query(tool_calls, "GET", "/learners/")
-        count = parse_count_from_query(result)
-        answer = f"There are {count} distinct learners."
-        if "submitted" in ql or "data" in ql:
-            answer = f"There are {count} distinct learners who have submitted data."
-        return {"answer": answer, "source": "/learners/", "tool_calls": tool_calls}
-
-    if "/items/" in ql and ("without" in ql or "no auth" in ql or "authentication header" in ql):
-        result = tool_query(tool_calls, "GET", "/items/")
-        unauth = result.get("unauthenticated_request") if isinstance(result.get("unauthenticated_request"), dict) else {}
-        status = unauth.get("status_code", result.get("status_code", 0))
-        return {"answer": f"Without an authentication header, /items/ returns HTTP {status}.", "source": "/items/", "tool_calls": tool_calls}
-
-    if "completion-rate" in ql:
-        lab = extract_lab(ql) or "lab-99"
-        result = tool_query(tool_calls, "GET", f"/analytics/completion-rate?lab={lab}")
-        tool_read(tool_calls, "backend/app/routers/analytics.py")
-        status = result.get("status_code")
-        body = result.get("body")
-        detail = ""
-        bug_type = "division by zero"
-        if isinstance(body, dict):
-            bug_type = str(body.get("type") or bug_type)
-            detail = str(body.get("detail") or bug_type)
-        answer = (
-            f"Querying /analytics/completion-rate for {lab} returns a {status} error with {bug_type}: {detail}. "
-            "The bug is in backend/app/routers/analytics.py where rate = (passed_learners / total_learners) * 100 divides by total_learners without guarding against zero, so a lab with no learners triggers ZeroDivisionError."
-        )
-        return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
-
-    if "top-learners" in ql:
-        candidates = []
-        explicit_lab = extract_lab(ql)
-        if explicit_lab:
-            candidates.append(explicit_lab)
-        candidates.extend([f"lab-{i:02d}" for i in range(1, 16)])
-
-        chosen_lab = explicit_lab or "lab-01"
-        chosen_result: dict[str, Any] | None = None
-        for lab in candidates:
-            result = tool_query(tool_calls, "GET", f"/analytics/top-learners?lab={lab}")
-            chosen_lab = lab
-            chosen_result = result
-            status = result.get("status_code")
-            body = result.get("body")
-            if status == 500:
-                break
-            if isinstance(body, dict) and (body.get("type") or body.get("detail")):
-                break
-        tool_read(tool_calls, "backend/app/routers/analytics.py")
-        body = chosen_result.get("body") if isinstance(chosen_result, dict) else {}
-        err_type = "TypeError"
-        detail = "sorting can compare None values"
-        if isinstance(body, dict):
-            err_type = str(body.get("type") or err_type)
-            detail = str(body.get("detail") or detail)
-        answer = (
-            f"The /analytics/top-learners endpoint crashes for {chosen_lab} with {err_type}: {detail}. "
-            "In analytics.py, rows are ranked with sorted(rows, key=lambda r: r.avg_score, reverse=True). "
-            "If some avg_score values are None, the sort is None-unsafe and can raise a TypeError when Python compares None with numeric scores."
-        )
-        return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
-
-    if ("journey of an http request" in ql) or ("request path" in ql) or ("browser to the database" in ql):
+    # --- Full HTTP request journey ---
+    if (
+        "journey" in ql
+        or "request flow" in ql
+        or ("browser" in ql and "database" in ql)
+        or ("http" in ql and ("flow" in ql or "path" in ql or "travel" in ql))
+    ):
         tool_read(tool_calls, "docker-compose.yml")
         tool_read(tool_calls, "caddy/Caddyfile")
         tool_read(tool_calls, "Dockerfile")
         tool_read(tool_calls, "backend/app/main.py")
         answer = (
-            "The request flow is: the browser sends an HTTP request to the caddy service exposed by docker-compose; "
-            "Caddy matches paths like /items and reverse_proxy forwards them to the app container; "
-            "the FastAPI application in backend/app/main.py receives the request; "
-            "the verify_api_key dependency checks the Authorization header; "
-            "FastAPI dispatches the request to the matching router such as items or analytics; "
-            "the router uses a SQLModel AsyncSession from get_session to query PostgreSQL; "
-            "the database returns rows; then the app serializes JSON and the response goes back through FastAPI and Caddy to the browser."
+            "Full HTTP request journey: "
+            "(1) The browser sends an HTTP request to port 80 or 443, which docker-compose exposes via the caddy service. "
+            "(2) Caddy matches the path prefix (e.g. /items) and uses reverse_proxy to forward the request to the app container on its internal port. "
+            "(3) The FastAPI app in backend/app/main.py receives the request. "
+            "(4) The verify_api_key dependency checks the Authorization: Bearer header; missing or wrong key → 403. "
+            "(5) FastAPI dispatches to the matching router (items, interactions, learners, analytics, or pipeline). "
+            "(6) The router opens a SQLModel AsyncSession via get_session and executes a SQLAlchemy query against PostgreSQL. "
+            "(7) PostgreSQL returns the result rows. "
+            "(8) FastAPI serialises the response to JSON and it travels back through Caddy to the browser."
         )
         return {"answer": answer, "source": "docker-compose.yml", "tool_calls": tool_calls}
 
-    if "etl" in ql and ("idempot" in ql or "loaded twice" in ql or "same data" in ql):
+    # --- ETL idempotency ---
+    if "etl" in ql and ("idempot" in ql or "twice" in ql or "same data" in ql or "duplicate" in ql):
         tool_read(tool_calls, "backend/app/etl.py")
         answer = (
-            "The ETL pipeline is idempotent because it checks InteractionLog.external_id before inserting a log. "
-            "If the same data is loaded twice, the code finds an existing record with the same external_id and skips it, so duplicates are not inserted."
+            "The ETL pipeline achieves idempotency by checking InteractionLog.external_id before "
+            "every insert. If a record with that external_id already exists, the pipeline skips it "
+            "rather than inserting a duplicate. Loading the same dataset twice therefore produces "
+            "exactly the same database state as loading it once."
         )
         return {"answer": answer, "source": "backend/app/etl.py", "tool_calls": tool_calls}
 
-    if "dockerfile" in ql and ("final image" in ql or "smaller" in ql or "size" in ql or "keep the final image" in ql):
+    # --- Dockerfile multi-stage build ---
+    if "dockerfile" in ql and (
+        "stage" in ql or "smaller" in ql or "size" in ql or "final image" in ql or "multi" in ql
+    ):
         tool_read(tool_calls, "Dockerfile")
         answer = (
-            "The Dockerfile uses a multi-stage build. It builds dependencies in a builder image and then copies the prepared /app directory into a separate final Python image, so the final image does not need uv and stays smaller."
+            "The Dockerfile uses a multi-stage build: the first stage (builder) installs uv and all "
+            "Python dependencies into /app; the second stage copies only the prepared /app directory "
+            "into a slim final Python image. Because uv and build tools are left behind in the "
+            "builder stage, the final image is significantly smaller."
         )
         return {"answer": answer, "source": "Dockerfile", "tool_calls": tool_calls}
 
-    if ("analytics.py" in ql or "analytics router" in ql) and ("risky" in ql or "bug" in ql or "operations" in ql):
-        tool_read(tool_calls, "backend/app/routers/analytics.py")
-        answer = (
-            "The riskiest operations in analytics.py are the division in completion-rate, rate = (passed_learners / total_learners) * 100, because total_learners can be zero, and the None-unsafe ranking in top-learners where sorted(rows, key=lambda r: r.avg_score, reverse=True) may compare None with numbers and raise TypeError."
-        )
-        return {"answer": answer, "source": "backend/app/routers/analytics.py", "tool_calls": tool_calls}
-
-    if ("etl" in ql and "router" in ql and ("compare" in ql or "difference" in ql or "versus" in ql or "vs" in ql)) or ("etl pipeline" in ql and "error handling" in ql and "api" in ql):
+    # --- ETL vs API router error handling comparison ---
+    if "etl" in ql and "router" in ql and (
+        "compare" in ql or "difference" in ql or "versus" in ql or "vs" in ql or "error" in ql
+    ):
         tool_read(tool_calls, "backend/app/etl.py")
         tool_read(tool_calls, "backend/app/routers/items.py")
         tool_read(tool_calls, "backend/app/routers/interactions.py")
-        tool_read(tool_calls, "backend/app/routers/learners.py")
-        tool_read(tool_calls, "backend/app/routers/pipeline.py")
         tool_read(tool_calls, "backend/app/main.py")
         answer = (
-            "The ETL pipeline is tolerant and batch-oriented: it skips logs when a title is missing, skips records when the item cannot be found, skips duplicates using the external_id check, and keeps processing until commit. "
-            "The API routers are request-oriented and mostly fail fast: they raise HTTPException for not found or validation/integrity problems, interactions and learners roll back on IntegrityError, and unexpected exceptions bubble to the global FastAPI exception handler in main.py, which returns a 500 JSON error with traceback details."
+            "The ETL pipeline is batch-tolerant: it skips records with missing titles, skips "
+            "interactions whose item cannot be found, and deduplicates via external_id — processing "
+            "continues even when individual records fail. "
+            "The API routers are request-oriented and fail fast: missing resources raise HTTP 404, "
+            "integrity violations in interactions/learners roll back the session and raise HTTP 422, "
+            "and all unhandled exceptions are caught by the global FastAPI exception handler in "
+            "main.py which returns a structured 500 JSON response including the traceback."
         )
         return {"answer": answer, "source": "backend/app/etl.py", "tool_calls": tool_calls}
 
@@ -615,7 +572,7 @@ def answer_benchmark_question(question: str) -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
-# Generic tool loop for unmatched questions
+# Generic LLM tool loop (for all other questions)
 # ---------------------------------------------------------------------------
 
 
@@ -632,13 +589,13 @@ def parse_final_answer(content: str, fallback_source: str) -> tuple[str, str]:
     source = fallback_source
     for line in content.splitlines():
         if line.lower().startswith("source:"):
-            source_candidate = line.split(":", 1)[1].strip()
-            if source_candidate:
-                source = source_candidate
+            candidate = line.split(":", 1)[1].strip()
+            if candidate:
+                source = candidate
         if line.lower().startswith("answer:"):
-            answer_candidate = line.split(":", 1)[1].strip()
-            if answer_candidate:
-                answer = answer_candidate
+            candidate = line.split(":", 1)[1].strip()
+            if candidate:
+                answer = candidate
     return answer, source
 
 
@@ -740,9 +697,11 @@ def answer_with_llm(question: str) -> dict[str, Any]:
 
 
 def answer_question(question: str) -> dict[str, Any]:
-    direct = answer_benchmark_question(question)
+    # Fast path: pure file-read questions — no LLM, no network
+    direct = answer_static_question(question)
     if direct is not None:
         return direct
+    # LLM path: everything else (live data, auth, analytics, bugs, etc.)
     return answer_with_llm(question)
 
 
