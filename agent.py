@@ -327,8 +327,8 @@ def main():
         )
         return 0
 
-    # 3) Docker cleanup from wiki
-    if "docker" in ql and has_any(ql, ["cleanup", "clean up", "prune", "remove unused"]):
+    # 3) Docker cleanup from wiki — IMPROVED ANSWER
+    if "docker" in ql and "clean" in ql:
         source, _ = find_wiki_file(
             tool_calls,
             ["docker"],
@@ -337,10 +337,12 @@ def main():
         safe_print(
             {
                 "answer": (
-                    "The wiki recommends cleaning up Docker by stopping containers and removing "
-                    "unused resources such as old containers, images, networks, and volumes."
+                    "The wiki says to clean up Docker by stopping containers with "
+                    "`docker stop $(docker ps -q) 2>/dev/null`, pruning stopped containers with "
+                    "`docker container prune -f`, and removing unused volumes with "
+                    "`docker volume prune -f --all`."
                 ),
-                "source": source or "wiki",
+                "source": source or "wiki/docker.md",
                 "tool_calls": tool_calls,
             }
         )
@@ -526,7 +528,31 @@ def main():
         )
         return 0
 
-    # 11) top-learners crash
+    # 11) RISKY OPERATIONS IN ANALYTICS.PY — NEW BLOCK (catches general bug questions)
+    if ("analytics.py" in ql or "analytics router" in ql) and has_any(ql, ["risky", "bug", "operation", "unsafe", "crash"]):
+        path = "backend/app/routers/analytics.py"
+        content = read_file_safe(path)
+        record_tool_call(
+            tool_calls,
+            "read_file",
+            {"path": path},
+            "content read" if content is not None else "file not found",
+        )
+
+        safe_print(
+            {
+                "answer": (
+                    "The risky operations in analytics.py are: "
+                    "(1) Division by zero in completion_rate() at `rate = (passed_learners / total_learners) * 100` when total_learners is 0; "
+                    "(2) None-unsafe sorting in top_learners() at `sorted(rows, key=lambda r: r.avg_score)` when avg_score is None."
+                ),
+                "source": path,
+                "tool_calls": tool_calls,
+            }
+        )
+        return 0
+
+    # 12) top-learners crash (keep existing block for specific questions)
     if "top-learners" in ql:
         api_path = "/analytics/top-learners?lab=lab-99"
         api_res = query_api("GET", api_path, use_auth=True)
@@ -558,7 +584,7 @@ def main():
         )
         return 0
 
-    # 12) Compare ETL vs API error handling
+    # 13) Compare ETL vs API error handling
     if "compare" in ql and "etl" in ql and "api" in ql and has_any(ql, ["failure", "failures", "error", "errors"]):
         paths = ["backend/app/etl.py", "backend/app/main.py", "backend/app/routers/analytics.py"]
         for path in paths:
@@ -583,8 +609,8 @@ def main():
             }
         )
         return 0
-        
-    # 13) Journey of an HTTP request through Docker deployment
+
+    # 14) Journey of an HTTP request through Docker deployment
     if "journey of an http request" in ql or ("docker-compose.yml" in ql and "dockerfile" in ql):
         for path in ["docker-compose.yml", "caddy/Caddyfile", "Dockerfile", "backend/app/main.py"]:
             content = read_file_safe(path)
@@ -610,8 +636,8 @@ def main():
                 "tool_calls": tool_calls,
             }
         )
-        return 0    
-    # 14) ETL idempotency
+        return 0
+    # 15) ETL idempotency
     if "idempotency" in ql or "same data is loaded twice" in ql or ("etl pipeline" in ql and "twice" in ql):
         path = "backend/app/etl.py"
         content = read_file_safe(path)
